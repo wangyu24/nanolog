@@ -15,9 +15,15 @@
 #include <chrono>
 #include <iomanip>
 
-namespace nanolog
+namespace NanoLog
 {
-	enum class LogLevel : uint8_t { INFO, WARN, CRIT };
+	enum class LogLevel : uint8_t { 
+    FAT = 0, 
+    ERR,
+    PUB,
+    INF,
+    DBG
+  };
 
 	/*
 	* Non guaranteed logging. Uses a ring buffer to hold log lines.
@@ -49,16 +55,15 @@ namespace nanolog
 			return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 		}
 
-		/* I want [2016-10-13 00:01:23.528514] */
+		/* I want [00:01:23.528514] */
 		void format_timestamp(std::ostream & os, uint64_t timestamp)
 		{
-			auto n = std::chrono::system_clock::now();
-			auto m = n.time_since_epoch();
-			auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(m).count();
-			//auto const msecs = diff % 1000;
-
-			std::time_t t = std::chrono::system_clock::to_time_t(n);
-			os << '[' << std::put_time(std::localtime(&t), "%Y-%m-%d %H.%M.%S") << "." << diff << ']';
+      auto duration = std::chrono::microseconds(timestamp);
+      std::chrono::high_resolution_clock::time_point time_point(duration);
+      std::time_t t = std::chrono::high_resolution_clock::to_time_t(time_point);
+      char microseconds[7];
+      sprintf(microseconds, "%06lu", timestamp % 1000000);
+			os << '[' << std::put_time(std::localtime(&t), "%H:%M:%S") << "." << microseconds << ']';
 		}
 
 		std::thread::id this_thread_id()
@@ -98,24 +103,28 @@ namespace nanolog
 	{
 		switch (loglevel)
 		{
-		case LogLevel::INFO:
-			return "INFO";
-		case LogLevel::WARN:
-			return "WARN";
-		case LogLevel::CRIT:
-			return "CRIT";
+		case LogLevel::FAT:
+			return "FAT";
+		case LogLevel::ERR:
+			return "ERR";
+		case LogLevel::PUB:
+			return "PUB";
+		case LogLevel::INF:
+			return "INF";
+		case LogLevel::DBG:
+			return "DBG";
 		}
-		return "XXXX";
+		return "UNKNOWN";
 	}
 
 	class NanoLogLine
 	{
 	public:
-		typedef std::tuple < char, uint32_t, uint64_t, int32_t, int64_t, double, const char*, char * > SupportedTypes;
-		NanoLogLine(LogLevel level, char const * file, char const * function, uint32_t line) : m_bytes_used(0)
+    using SupportedTypes = std::tuple < char, uint32_t, uint64_t, int32_t, int64_t, double, const char*, char * >;
+		NanoLogLine(LogLevel level, char const * file, uint32_t line) : m_bytes_used(0)
 			, m_buffer_size(sizeof(m_stack_buffer))
 		{
-			encode0(timestamp_now(), this_thread_id(), file, function, line, level);
+			encode0(timestamp_now(), this_thread_id(), file, line, level);
 		}
 
 		~NanoLogLine() = default;
@@ -130,21 +139,19 @@ namespace nanolog
 			uint64_t timestamp = *reinterpret_cast <uint64_t *>(b); b += sizeof(uint64_t);
 			std::thread::id threadid = *reinterpret_cast <std::thread::id *>(b); b += sizeof(std::thread::id);
 			const char* file = *reinterpret_cast <const char* *>(b); b += sizeof(const char*);
-			const char* function = *reinterpret_cast <const char* *>(b); b += sizeof(const char*);
 			uint32_t line = *reinterpret_cast <uint32_t *>(b); b += sizeof(uint32_t);
 			LogLevel loglevel = *reinterpret_cast <LogLevel *>(b); b += sizeof(LogLevel);
 
 			format_timestamp(os, timestamp);
-
 			os << '[' << to_string(loglevel) << ']'
 				<< '[' << threadid << ']'
-				<< '[' << file << ':' << function << ':' << line << "] ";
+				<< '[' << file << ':' << line << "] ";
 
 			stringify(os, b, end);
 
 			os << std::endl;
 
-			if (loglevel >= LogLevel::CRIT)
+			if (loglevel >= LogLevel::PUB)
 				os.flush();
 		}
 
@@ -325,7 +332,7 @@ namespace nanolog
 			Item()
 				: flag{ ATOMIC_FLAG_INIT }
 				, written(0)
-				, logline(LogLevel::INFO, nullptr, nullptr, 0)
+				, logline(LogLevel::INF, nullptr, 0)
 			{
 			}
 
@@ -491,7 +498,7 @@ namespace nanolog
 			if (read_buffer == nullptr)
 				return false;
 
-			if (bool success = read_buffer->try_pop(logline, m_read_index))
+			if (read_buffer->try_pop(logline, m_read_index))
 			{
 				m_read_index++;
 				if (m_read_index == Buffer::size)
@@ -566,9 +573,26 @@ namespace nanolog
 			m_os.reset(new std::ofstream());
 			// TODO Optimize this part. Does it even matter ?
 			std::string log_file_name = m_name;
-			log_file_name.append(".");
+
+      auto AppendCurTimeStampPid = [&]() {
+        timeval tv;
+        tm *nowtm = nullptr;
+        gettimeofday(&tv, nullptr);
+        nowtm = localtime(&tv.tv_sec);
+        char tbuf[32];
+        strftime(tbuf, sizeof(tbuf), "%H%M%S", nowtm);
+        char buf[128];
+
+        snprintf(buf, sizeof(buf), "%d%02d%02d-%s-%d-",
+           nowtm->tm_year + 1900, nowtm->tm_mon + 1,
+           nowtm->tm_mday, tbuf, getpid());
+        log_file_name.append(buf);
+      };
+
+			log_file_name.append("-");
+			AppendCurTimeStampPid();
 			log_file_name.append(std::to_string(++m_file_number));
-			log_file_name.append(".txt");
+			log_file_name.append(".log");
 			m_os->open(log_file_name, std::ofstream::out | std::ofstream::trunc);
 		}
 
@@ -618,7 +642,7 @@ namespace nanolog
 			while (m_state.load(std::memory_order_acquire) == State::INIT)
 				std::this_thread::sleep_for(std::chrono::microseconds(50));
 
-			NanoLogLine logline(LogLevel::INFO, nullptr, nullptr, 0);
+			NanoLogLine logline(LogLevel::INF, nullptr, 0);
 
 			while (m_state.load() == State::READY)
 			{
@@ -705,9 +729,14 @@ namespace nanolog
 		nanologger.reset(new NanoLogger(gl, log_directory, log_file_name, log_file_roll_size_mb));
 		atomic_nanologger.store(nanologger.get(), std::memory_order_seq_cst);
 	}
-} // namespace nanolog
 
-#define NANO_LOG(LEVEL) nanolog::NanoLog() == nanolog::NanoLogLine(LEVEL, __FILE__, __func__, __LINE__)
-#define LOG_INFO nanolog::is_logged(nanolog::LogLevel::INFO) && NANO_LOG(nanolog::LogLevel::INFO)
-#define LOG_WARN nanolog::is_logged(nanolog::LogLevel::WARN) && NANO_LOG(nanolog::LogLevel::WARN)
-#define LOG_CRIT nanolog::is_logged(nanolog::LogLevel::CRIT) && NANO_LOG(nanolog::LogLevel::CRIT)
+} // namespace NanoLog
+#define filename(x) strrchr(x,'/')?strrchr(x,'/')+1:x
+#define NANO_LOG(LEVEL) NanoLog::NanoLog() == NanoLog::NanoLogLine(LEVEL, filename(__FILE__), __LINE__)
+#define NLOG_FAT NanoLog::is_logged(NanoLog::LogLevel::FAT) && NANO_LOG(NanoLog::LogLevel::FAT)
+#define NLOG_ERR NanoLog::is_logged(NanoLog::LogLevel::ERR) && NANO_LOG(NanoLog::LogLevel::ERR)
+#define NLOG_PUB NanoLog::is_logged(NanoLog::LogLevel::PUB) && NANO_LOG(NanoLog::LogLevel::PUB)
+#define NLOG_INF NanoLog::is_logged(NanoLog::LogLevel::INF) && NANO_LOG(NanoLog::LogLevel::INF)
+#define NLOG_DBG NanoLog::is_logged(NanoLog::LogLevel::DBG) && NANO_LOG(NanoLog::LogLevel::DBG)
+
+
